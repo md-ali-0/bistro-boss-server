@@ -3,6 +3,9 @@ const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 const jwt = require("jsonwebtoken");
+const formData = require("form-data");
+const Mailgun = require("mailgun.js");
+const mailgun = new Mailgun(formData);
 const stripe = require("stripe")(process.env.STRIPE_SECRET);
 const app = express();
 const port = process.env.PORT || 8080;
@@ -28,6 +31,11 @@ const paymentsCollection = client.db("bistroBossDB").collection("payments");
 // );
 app.use(cors());
 app.use(express.json());
+
+const mg = mailgun.client({
+    username: "api",
+    key: process.env.PRIVATE_API_KEY,
+});
 
 // jwt Api
 app.post("/jwt", async (req, res) => {
@@ -88,7 +96,6 @@ app.get("/users/:email", verifyToken, async (req, res) => {
 app.post("/users", async (req, res) => {
     const user = req.body;
 
-    console.log(user.email);
     const filter = {
         email: user.email,
     };
@@ -203,40 +210,129 @@ app.delete("/carts/:id", async (req, res) => {
 });
 app.post("/create-payment-intent", async (req, res) => {
     const { price } = req.body;
-    const amount = parseInt(price*100);
-    
+    const amount = parseInt(price * 100);
+
     const paymentIntent = await stripe.paymentIntents.create({
         amount: amount,
-        currency: 'usd',
-        payment_method_types: ['card'],
-    })
+        currency: "usd",
+        payment_method_types: ["card"],
+    });
     res.send({
-        clientSecret: paymentIntent.client_secret
-    })
+        clientSecret: paymentIntent.client_secret,
+    });
 });
-app.get('/payments/:email', verifyToken, async(req,res)=>{
-    const email =  req.params.email;
+app.get("/payments/:email", verifyToken, async (req, res) => {
+    const email = req.params.email;
     const query = {
-        email: email
-    }
+        email: email,
+    };
     if (email !== req.user.email) {
         return res.status(403).send({ message: "unauthorized access" });
     }
-    
+
     const result = await paymentsCollection.find(query).toArray();
-    res.send(result)
-})
-app.post('/payments', async(req,res)=>{
+    res.send(result);
+});
+app.post("/payments", async (req, res) => {
     const payment = req.body;
     const paymentResult = await paymentsCollection.insertOne(payment);
     const query = {
         _id: {
-            $in: payment.cartIds.map(id=> new ObjectId(id))
-        }
-    }
-    const deleteResult = await cartCollection.deleteMany(query)
-    res.send(deleteResult)
-})
+            $in: payment.cartIds.map((id) => new ObjectId(id)),
+        },
+    };
+    mg.messages
+        .create('sandbox0ec96249fcf4414cb0eb8a9abfd9c150.mailgun.org', {
+            from: "Mailgun Sandbox <postmaster@sandbox0ec96249fcf4414cb0eb8a9abfd9c150.mailgun.org>",
+            to: ["mohammad.98482@gmail.com"],
+            subject: "Bistro Boss - Thanks you for orders",
+            text: "Testing some Mailgun awesomness!",
+            html: `<div>
+                        <h3>Thanks your For Ordering!</h3>
+                        <h2>Your Order id : ${paymentResult.id}</h2>
+                    </div>`,
+        })
+        .then((msg) => console.log(msg)) // logs response data
+        .catch((err) => console.log(err)); // logs any error`;
+    const deleteResult = await cartCollection.deleteMany(query);
+    res.send(deleteResult);
+});
+app.get("/admin-stats", async (req, res) => {
+    const totalUsers = await usersCollection.estimatedDocumentCount();
+    const totalOrders = await paymentsCollection.estimatedDocumentCount();
+    const totalMenus = await menusCollection.estimatedDocumentCount();
+
+    const result = await paymentsCollection
+        .aggregate([
+            {
+                $group: {
+                    _id: null,
+                    totalRevenue: { $sum: "$price" },
+                },
+            },
+        ])
+        .toArray();
+    const totalRevenue = result.length > 0 ? result[0].totalRevenue : 0;
+    // const totalRevenue = payments.reduce((total, item)=>total+item.price,0)
+
+    res.send({ totalUsers, totalOrders, totalMenus, totalRevenue });
+});
+app.get("/order-stats", async (req, res) => {
+    const result = await paymentsCollection
+        .aggregate([
+            {
+                $unwind: "$menuIds",
+            },
+            // {
+            //     $lookup: {
+            //         from: "menusCollection",
+            //         localField: "menuIds",
+            //         foreignField: "_id",
+            //         as: "menuItems",
+            //     },
+            // },
+            {
+                $lookup: {
+                    from: "menusCollection",
+                    let: { objectId: { $toObjectId: "$menuIds" } },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $eq: [
+                                        "$_id", // Convert foreignId to ObjectId
+                                        "$$objectId",
+                                    ],
+                                },
+                            },
+                        },
+                    ],
+                    as: "menuItems",
+                },
+            },
+            {
+                $unwind: "$menuItems",
+            },
+            {
+                $group: {
+                    _id: "$menuItems.category",
+                    quantity: { $sum: 1 },
+                    revenue: { $sum: "$menuItems.price" },
+                },
+            },
+            {
+                $project: {
+                    _id: 0,
+                    category: "$_id",
+                    quantity: "$quantity",
+                    revenue: "$revenue",
+                },
+            },
+        ])
+        .toArray();
+
+    res.send(result);
+});
 
 app.listen(port, () => {
     console.log("Bistro Boss is sitting on ", port);
